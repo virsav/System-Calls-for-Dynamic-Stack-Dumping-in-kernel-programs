@@ -1,0 +1,325 @@
+diff -uNr kernel.old/arch/x86/syscalls/syscall_32.tbl kernel/arch/x86/syscalls/syscall_32.tbl
+--- kernel.old/arch/x86/syscalls/syscall_32.tbl	2017-06-17 10:44:31.000000000 -0700
++++ kernel/arch/x86/syscalls/syscall_32.tbl	2020-05-01 14:42:07.245214052 -0700
+@@ -365,3 +365,5 @@
+ 356	i386	memfd_create		sys_memfd_create
+ 357	i386	bpf			sys_bpf
+ 358	i386	execveat		sys_execveat			stub32_execveat
++359	i386	insdump			sys_insdump
++360	i386	rmdump			sys_rmdump
+diff -uNr kernel.old/include/linux/dynamic_dump_stack.h kernel/include/linux/dynamic_dump_stack.h
+--- kernel.old/include/linux/dynamic_dump_stack.h	1969-12-31 17:00:00.000000000 -0700
++++ kernel/include/linux/dynamic_dump_stack.h	2020-05-01 14:42:07.233214051 -0700
+@@ -0,0 +1,8 @@
++
++//Including the structure dumpmode_t, so that it can be defined for syscalls
++struct dumpmode_t {
++	unsigned int mode;
++};
++
++//Allowing usage of exit_kprobe funtion from other files.
++extern int exit_kprobe(pid_t pid);
+\ No newline at end of file
+diff -uNr kernel.old/include/linux/syscalls.h kernel/include/linux/syscalls.h
+--- kernel.old/include/linux/syscalls.h	2017-06-17 10:44:57.000000000 -0700
++++ kernel/include/linux/syscalls.h	2020-05-01 14:42:07.245214052 -0700
+@@ -67,6 +67,8 @@
+ struct sigaltstack;
+ union bpf_attr;
+ 
++struct dumpmode_t;
++
+ #include <linux/types.h>
+ #include <linux/aio_abi.h>
+ #include <linux/capability.h>
+@@ -882,4 +884,8 @@
+ 			const char __user *const __user *argv,
+ 			const char __user *const __user *envp, int flags);
+ 
++asmlinkage long sys_insdump(const char __user *symbolname, struct dumpmode_t __user *dumpmode);
++
++asmlinkage long sys_rmdump(int dumpid);
++
+ #endif
+diff -uNr kernel.old/kernel/exit.c kernel/kernel/exit.c
+--- kernel.old/kernel/exit.c	2017-06-17 10:44:58.000000000 -0700
++++ kernel/kernel/exit.c	2020-05-01 14:42:07.237214052 -0700
+@@ -59,6 +59,8 @@
+ #include <asm/pgtable.h>
+ #include <asm/mmu_context.h>
+ 
++#include <linux/dynamic_dump_stack.h>		//Including header file of dynamic_dump_stack
++
+ static void exit_mm(struct task_struct *tsk);
+ 
+ static void __unhash_process(struct task_struct *p, bool group_dead)
+@@ -655,6 +657,10 @@
+ 	int group_dead;
+ 	TASKS_RCU(int tasks_rcu_i);
+ 
++	#ifdef CONFIG_DYNAMIC_DUMP_STACK		//checking if dynamic_dump_stack enabled in kernel
++	exit_kprobe(tsk->pid);					//calling  remove all kprobe function 
++	#endif
++
+ 	profile_task_exit(tsk);
+ 
+ 	WARN_ON(blk_needs_flush_plug(tsk));
+diff -uNr kernel.old/lib/dynamic_dump_stack.c kernel/lib/dynamic_dump_stack.c
+--- kernel.old/lib/dynamic_dump_stack.c	1969-12-31 17:00:00.000000000 -0700
++++ kernel/lib/dynamic_dump_stack.c	2020-05-01 14:43:08.533215610 -0700
+@@ -0,0 +1,225 @@
++#include <linux/kernel.h>
++#include <linux/module.h>
++#include <linux/syscalls.h>
++#include <linux/kprobes.h>
++#include <linux/kallsyms.h>
++#include <linux/list.h>
++#include <linux/slab.h>
++#include <linux/sched.h>
++#include <linux/string.h>
++#include <linux/spinlock.h>
++
++#include <linux/dynamic_dump_stack.h>
++
++unsigned int ref_dds_id;	//reference dump stack id, so that every time we can assign new id
++static LIST_HEAD(dumpstack_list);	//static list head for traversing
++
++//spinlock used beacuse the operation duration is small and it will take less cpu time, no context switch for lock will make it faster
++//also the addition and deletion of element from the linked list should not be blocked as it might mess up the list and will be costly
++static DEFINE_SPINLOCK(spinlock_insert);		//Initialising  spinlock for safe operation of adding data into the linked list
++static DEFINE_SPINLOCK(spinlock_remove);		//Initialising spinlock for safe removal of element from the linked list
++static DEFINE_SPINLOCK(spinlock_exit);			//Initialising spinlock for safe removal of element from the linked list
++
++struct dds_struct{ //per dump_stack structure
++
++	unsigned int dds_id; //dumpstack id
++	unsigned int dds_mode;	//dumpstack mode
++	char prob_sym_name[30];		//symbolname for probing
++	struct kprobe kp;			//initilising Kprobe
++	pid_t procs_id;				//process id for dump_stack
++	pid_t trd_grpid;			//thread group id for dump_stack
++	pid_t realparentid;			//real parent id for dump_stack
++	struct list_head dds_list_next;		//list_head for dumpstack structure
++
++};
++
++struct dds_struct *dds_pointer;
++
++//Prehandler for Kprobe of symbolname and checking dumpstack mode and accordingly dumping stack or not.
++int Pre_Handler(struct kprobe *probe, struct pt_regs *regs){
++	
++    struct dds_struct *dds_current;			//structure pointer for dds_struct
++    struct task_struct* task = current;		//taking current task details
++    pid_t th_gid = task->tgid;				//taking thread group id of the current task
++    pid_t procs_id = task->pid;				//taking process id of the current task
++    pid_t rp_pid = task->real_parent->pid;		//taking real parent id of the current task
++	
++    dds_current = container_of(probe, struct dds_struct, kp);	//getting the address of the dds_struct for the current kprobe invoked
++
++    printk(KERN_INFO "Task Process Id: %d\n", procs_id);
++    printk(KERN_INFO "Task Threadg Id: %d\n", th_gid);
++    printk(KERN_INFO "Task RealParent: %d\n", rp_pid);
++    printk(KERN_INFO "DDS Process ID: %d\n",dds_current->procs_id);
++    printk(KERN_INFO "DDS Threadg ID: %d\n",dds_current->trd_grpid);
++    printk(KERN_INFO "DDS RealParent ID: %d\n",dds_current->realparentid);
++
++    //Checking dumpstack mode = 0 and enabling dump_stack only for the owner 
++    if(dds_current->dds_mode == 0 && procs_id == dds_current->procs_id){   
++   	 	dump_stack();
++    } //Checking dumpstack mode = 1 and enabling dump_stack only for the owner or any of its child.
++    //Checking if the real parent of the process is same as the real parent of the owner
++    //Also checking if the incoming request is from any threads created by owner
++    else if(dds_current->dds_mode == 1 && (th_gid == dds_current->trd_grpid || procs_id == dds_current->procs_id || 
++    			rp_pid == dds_current->realparentid)){            
++   	 	dump_stack();
++    }//Else Checking dumpstack mode > 1 and enabling dumpstack for any process
++    else if(dds_current->dds_mode > 1){   
++   	 	dump_stack();
++    }
++    return 0;
++}
++
++
++//Insert function for Kprobe and hence adding it to the linked list of processes who did dump_stack
++static int insert_kp(const char * symbolname, unsigned long address, struct dumpmode_t * dumpmode){
++
++	struct dumpmode_t user_mode;			//dumpmode_t coming from user
++	struct task_struct* task = current;		//taking current task details
++	pid_t th_gid = task->tgid;				//taking thread group id of the current task
++ 	pid_t procs_id = task->pid;				//taking process id of the current task
++ 	pid_t realparentid = task->real_parent->pid;	//taking the real parent id of the curent task
++
++	dds_pointer = (struct dds_struct *)kmalloc(sizeof(struct dds_struct), GFP_KERNEL);	//Allocating space for the dumpstack structure
++	memset(dds_pointer, 0, sizeof(struct dds_struct));
++
++	memcpy(&user_mode, dumpmode, sizeof(user_mode));
++	printk(KERN_INFO "Dumpstack mode of the owner is - %d\n", user_mode.mode);
++	
++	//Putting all the details for the dumpstack structure
++	dds_pointer->procs_id = procs_id;
++	dds_pointer->trd_grpid = th_gid;
++	dds_pointer->realparentid = realparentid;
++	dds_pointer->dds_mode = user_mode.mode;
++	snprintf(dds_pointer->prob_sym_name, sizeof(char)*30, "%s", symbolname);
++	memset(&dds_pointer->kp, 0, sizeof(struct kprobe));
++	dds_pointer->kp.pre_handler = Pre_Handler;
++    dds_pointer->kp.addr = (kprobe_opcode_t *)address;
++	dds_pointer->dds_id = ref_dds_id++;
++
++	//Registering Krpobe and returning EINVAL when address of the symbol is in the blacklist of krpobe (not in text section)
++	if(register_kprobe(&dds_pointer->kp)){
++		printk(KERN_INFO "KPROBE did not register, Error at the SYMBOL address %p\n", (void*)(address));
++		return -EINVAL;
++	}
++
++	//locking 
++	spin_lock(&spinlock_insert);
++	list_add(&dds_pointer->dds_list_next, &dumpstack_list);		//Inserting dumpstack structure into the linked list
++	printk(KERN_INFO "KPROBE successfully inserted!\n");
++	spin_unlock(&spinlock_insert);	//unlocking
++
++	return dds_pointer->dds_id;
++
++}
++
++
++//Remove dump_stack probe function
++static int remove_kp(int dumpid){
++
++    struct dds_struct *struct_temp;			//temporary storage pointer for linked list traversing
++    bool dds_id_flag = false;				//Flag for checking if the process is present the linked list
++    struct dds_struct *struct_pos;			//cursore pointer for linked list traversing
++    struct task_struct* task = current;		//taking current task details
++    pid_t procs_id = task->pid;				//taking process id of the current task
++
++    spin_lock(&spinlock_remove);			//locking
++
++    //Traversing through the linked list and checking for the process present or not 
++    //and safely removing it from the list without affecting other elements
++	list_for_each_entry_safe(struct_pos, struct_temp, &dumpstack_list, dds_list_next) {
++		if(struct_pos->dds_id == dumpid && struct_pos->procs_id == procs_id) {
++			dds_id_flag = true;
++			break;
++		}
++    }
++   
++    //If process found and is owner then remove that element from the linked list and unregister the Kprobe
++    if(dds_id_flag){
++		printk(KERN_INFO "Dumpstack exists! Removing KPROBE...\n");
++		unregister_kprobe(&struct_pos->kp);
++		list_del(&struct_pos->dds_list_next);
++		kfree(struct_pos); 
++    }
++    else{
++		printk(KERN_INFO "Dumpstack does not exists!\n");
++		spin_unlock(&spinlock_remove);			//unlocking
++		return -EINVAL;
++    }
++    spin_unlock(&spinlock_remove);			//unlocking
++
++    return 1;
++
++}
++
++
++//System call definition of INSDUMP
++SYSCALL_DEFINE2(insdump,const char __user *, symbolname, struct dumpmode_t __user *, dumpmode){
++	  	
++#ifdef CONFIG_DYNAMIC_DUMP_STACK		//checking if dynamic dump stack is enabled in kernel or not
++		
++	unsigned long address;	
++	int ddsid;
++	
++	printk(KERN_INFO "Dynamic_dump_stack is enabled, SYSCALL INSDUMP started\n");
++   	address = kallsyms_lookup_name(symbolname);	//looking for the address of the symbolname send by user
++	
++	//Checking if address exits, if not then returning EINVAL
++	if(address == 0){ 
++		printk(KERN_INFO "SYMBOL NAME not found!\n");
++		return -EINVAL;
++	}
++	
++	printk(KERN_INFO "SYMOBOL NAME is located! Inserting KPROBE...\n");
++
++	ddsid = insert_kp(symbolname, address, dumpmode);	//Calling insert Kprobe function defined above
++
++	return ddsid;		//Returning the dumpstackid on SUCCESS
++#else	
++	return 0;			//Else returning 0 if dynamic dump stack not enabled
++#endif
++}
++
++
++//System call defintion for RMDUMP
++SYSCALL_DEFINE1(rmdump, int, dumpid){
++
++#ifdef CONFIG_DYNAMIC_DUMP_STACK		//checking if dynamic dump stack is enabled in kernel or not
++
++    printk(KERN_INFO "Dynamic_dump_stack is enabled, SYSCALL RMDUMP started\n");
++
++    remove_kp(dumpid);		//calling remove kprobe funtion defined above
++
++	return 1;		//Returning 1 on SUCCESS
++#else
++	return 0;		//Else returning 0 if dynamic dump stack not enabled
++#endif
++}
++
++
++//Exit kprobe function for removing all the kprobes inserted by the process. (Will be called in the exit routine)
++//Calling this function in do_exit will make this function execute everytime when any process exits in the kernel,
++//do_exit will be executed everytime there is an exit system call, process exiting willingly or unwillingly.
++//This will burn CPU cycles for checking everytime if the process is present in the linked list or not.
++//Easy to implement but also requires us to modify the existing kernel
++//Also no overhead to get the address and probe it (if the address is corrupted then the probe function would fail) 
++int exit_kprobe(pid_t procs_id) {
++
++    struct dds_struct *struct_pos;		//cursore pointer for linked list traversing
++    struct dds_struct *struct_temp;		//temporary storage pointer for linked list traversing
++
++  
++  	spin_lock(&spinlock_exit);			//locking
++
++  	//Traversing through the linked list and checking for the process present or not 
++    //and safely removing it from the list without affecting other elements
++    list_for_each_entry_safe(struct_pos, struct_temp, &dumpstack_list, dds_list_next) {
++		if(struct_pos->procs_id == procs_id) {
++			unregister_kprobe(&struct_pos->kp);				//removing the kprobe
++			printk(KERN_INFO "Removed KPROBE, Exiting Process %d.\n", procs_id);
++			list_del(&struct_pos->dds_list_next);			//deleting element from the linked list
++			kfree(struct_pos);
++		}
++    }
++    spin_unlock(&spinlock_exit);		//unlocking
++    return 1;	
++}
+diff -uNr kernel.old/lib/Kconfig.debug kernel/lib/Kconfig.debug
+--- kernel.old/lib/Kconfig.debug	2017-06-17 10:44:58.000000000 -0700
++++ kernel/lib/Kconfig.debug	2020-05-01 14:42:07.237214052 -0700
+@@ -1593,6 +1593,14 @@
+ 
+ 	  If unsure, say N.
+ 
++config DYNAMIC_DUMP_STACK
++	bool "Enable dynamic_dump_stack"
++	default n
++	help
++	  Enable this option to test the dynamic insertion and deletion of dump_stack.
++
++	  If unsure, say N.
++
+ endmenu # runtime tests
+ 
+ config PROVIDE_OHCI1394_DMA_INIT
+diff -uNr kernel.old/lib/Makefile kernel/lib/Makefile
+--- kernel.old/lib/Makefile	2017-06-17 10:44:58.000000000 -0700
++++ kernel/lib/Makefile	2020-05-01 14:42:07.241214052 -0700
+@@ -21,7 +21,7 @@
+ 
+ lib-y	+= kobject.o klist.o
+ obj-y	+= lockref.o
+-
++obj-y	+= dynamic_dump_stack.o
+ obj-y += bcd.o div64.o sort.o parser.o halfmd4.o debug_locks.o random32.o \
+ 	 bust_spinlocks.o hexdump.o kasprintf.o bitmap.o scatterlist.o \
+ 	 gcd.o lcm.o list_sort.o uuid.o flex_array.o iovec.o clz_ctz.o \
